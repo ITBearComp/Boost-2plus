@@ -1,0 +1,170 @@
+#include <iostream>
+#include <chrono>
+#include <cstdlib>
+#include <cuda_runtime.h>
+
+// CPU реализация
+void blurFilterCPU(unsigned char* input, unsigned char* output, int width, int height) {
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int sum = 0;
+            int count = 0;
+            
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int nx = x + dx;
+                    int ny = y + dy;
+                    
+                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                        sum += input[ny * width + nx];
+                        count++;
+                    }
+                }
+            }
+            
+            output[y * width + x] = static_cast<unsigned char>(sum / count);
+        }
+    }
+}
+
+// GPU ядро с shared memory
+__global__ void blurFilterCUDA(unsigned char* input, unsigned char* output, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (x >= width || y >= height) return;
+    
+    const int sharedWidth = blockDim.x + 2;
+    const int sharedHeight = blockDim.y + 2;
+    
+    extern __shared__ unsigned char sharedBlock[];
+    
+    int sharedX = threadIdx.x + 1;
+    int sharedY = threadIdx.y + 1;
+    
+    if (x < width && y < height) {
+        sharedBlock[sharedY * sharedWidth + sharedX] = input[y * width + x];
+    }
+    
+    if (threadIdx.x == 0 && x > 0) {
+        sharedBlock[sharedY * sharedWidth] = input[y * width + (x - 1)];
+    }
+    if (threadIdx.x == blockDim.x - 1 && x < width - 1) {
+        sharedBlock[sharedY * sharedWidth + (sharedX + 1)] = input[y * width + (x + 1)];
+    }
+    if (threadIdx.y == 0 && y > 0) {
+        sharedBlock[threadIdx.y * sharedWidth + sharedX] = input[(y - 1) * width + x];
+    }
+    if (threadIdx.y == blockDim.y - 1 && y < height - 1) {
+        sharedBlock[(sharedY + 1) * sharedWidth + sharedX] = input[(y + 1) * width + x];
+    }
+    
+    __syncthreads();
+    
+    if (x < width && y < height) {
+        int sum = 0;
+        int count = 0;
+        
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                int sx = sharedX + dx;
+                int sy = sharedY + dy;
+                
+                if (sx >= 0 && sx < sharedWidth && sy >= 0 && sy < sharedHeight) {
+                    sum += sharedBlock[sy * sharedWidth + sx];
+                    count++;
+                }
+            }
+        }
+        
+        output[y * width + x] = static_cast<unsigned char>(sum / count);
+    }
+}
+
+// Инициализация изображения случайными значениями
+void initializeImage(unsigned char* image, int width, int height) {
+    for (int i = 0; i < width * height; ++i) {
+        image[i] = rand() % 256;
+    }
+}
+
+// Сравнение двух изображений
+bool compareImages(unsigned char* img1, unsigned char* img2, int width, int height) {
+    for (int i = 0; i < width * height; ++i) {
+        if (img1[i] != img2[i]) {
+            std::cout << "Mismatch at position " << i << ": " << (int)img1[i] << " vs " << (int)img2[i] << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+int main() {
+    const int width = 1024;
+    const int height = 1024;
+    
+    // Выделение памяти на хосте
+    unsigned char* h_input = new unsigned char[width * height];
+    unsigned char* h_output_cpu = new unsigned char[width * height];
+    unsigned char* h_output_gpu = new unsigned char[width * height];
+    
+    // Инициализация входного изображения
+    initializeImage(h_input, width, height);
+    
+    // CPU обработка
+    auto start_cpu = std::chrono::high_resolution_clock::now();
+    blurFilterCPU(h_input, h_output_cpu, width, height);
+    auto end_cpu = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> cpu_time = end_cpu - start_cpu;
+    
+    std::cout << "CPU time: " << cpu_time.count() << " seconds" << std::endl;
+    
+    // GPU обработка
+    unsigned char *d_input, *d_output;
+    
+    cudaMalloc(&d_input, width * height * sizeof(unsigned char));
+    cudaMalloc(&d_output, width * height * sizeof(unsigned char));
+    
+    cudaMemcpy(d_input, h_input, width * height * sizeof(unsigned char), cudaMemcpyHostToDevice);
+    
+    // Размер блока и сетки
+    dim3 blockSize(16, 16);
+    dim3 gridSize((width + blockSize.x - 1) / blockSize.x, 
+                  (height + blockSize.y - 1) / blockSize.y);
+    
+    // Размер shared memory
+    size_t sharedMemSize = (blockSize.x + 2) * (blockSize.y + 2) * sizeof(unsigned char);
+    
+    // Измерение времени GPU
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    cudaEventRecord(start);
+    blurFilterCUDA<<<gridSize, blockSize, sharedMemSize>>>(d_input, d_output, width, height);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    float gpu_time = 0;
+    cudaEventElapsedTime(&gpu_time, start, stop);
+    
+    std::cout << "GPU time: " << gpu_time / 1000 << " seconds" << std::endl;
+    
+    cudaMemcpy(h_output_gpu, d_output, width * height * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+    
+    // Сравнение результатов
+    if (compareImages(h_output_cpu, h_output_gpu, width, height)) {
+        std::cout << "Results match!" << std::endl;
+    } else {
+        std::cout << "Results don't match!" << std::endl;
+    }
+    
+    // Освобождение памяти
+    delete[] h_input;
+    delete[] h_output_cpu;
+    delete[] h_output_gpu;
+    cudaFree(d_input);
+    cudaFree(d_output);
+    
+    return 0;
+}
